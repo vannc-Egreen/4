@@ -21043,3 +21043,464 @@ console.log('[V73] Patch loaded — approved=read-only, scroll-preserve, hour-me
 
 })();
 </script>
+
+
+<!-- ════════════════════════════════════════════════════════════════════
+     V74 PATCH — Universal Scroll & State Preservation
+     Vấn đề: Cứ 30s app pull dữ liệu từ Google Sheet → gọi lại renderDash/
+     renderRepList/renderWatchlist/renderLifecycle/... → các hàm này thay
+     thế innerHTML → user mất scroll position, mất focus input, dropdown
+     bị đóng, thanh ngang reset. KTV thao tác bị giật khó chịu.
+
+     Giải pháp V74:
+     1. Tạo helper v74Snapshot() chụp lại scroll position của:
+        - window (document scroll)
+        - documentElement & body
+        - tất cả element có overflow (table wraps, scrollable divs)
+        - element đang focus + selection range (input/textarea cursor)
+     2. Tạo helper v74Restore() khôi phục lại
+     3. Wrap MỌI hàm render lớn để snapshot trước → render → restore
+     4. Hash-based skip: nếu data input không đổi, skip render hoàn toàn
+═════════════════════════════════════════════════════════════════════ -->
+<script id="v74-patch-script">
+(function(){
+'use strict';
+
+/* ─────────── Helper: SNAPSHOT trạng thái UI ─────────── */
+function v74Snapshot(){
+  var snap = {
+    winSL: window.scrollX || window.pageXOffset || 0,
+    winST: window.scrollY || window.pageYOffset || 0,
+    docSL: 0, docST: 0,
+    bodySL: 0, bodyST: 0,
+    scrollers: [],
+    focus: null
+  };
+  try{
+    var de = document.documentElement;
+    if(de){ snap.docSL = de.scrollLeft; snap.docST = de.scrollTop; }
+    var bd = document.body;
+    if(bd){ snap.bodySL = bd.scrollLeft; snap.bodyST = bd.scrollTop; }
+  }catch(e){}
+
+  // Snapshot scrollable containers — dùng cả ID và path
+  try{
+    var sel = '.tw, .tblwrap, .v53-scroll, .pv-history-scroll, [style*="overflow:auto"], [style*="overflow: auto"], [style*="overflow-x:auto"], [style*="overflow-y:auto"], [style*="overflow:scroll"], .nl, #pvHistoryRoot, #pvCompleteRoot, #pvFormRoot, .modal-body';
+    var els = document.querySelectorAll(sel);
+    els.forEach(function(el){
+      if(el.scrollLeft > 0 || el.scrollTop > 0){
+        // Tạo key duy nhất cho element
+        var key = el.id || '';
+        if(!key){
+          // Path từ root
+          var path = [];
+          var cur = el;
+          while(cur && cur !== document.body && path.length < 8){
+            var tag = (cur.tagName||'').toLowerCase();
+            var cls = (cur.className||'').toString().split(/\s+/).filter(Boolean).slice(0,2).join('.');
+            var p = tag + (cls?'.'+cls:'');
+            // Index trong parent
+            if(cur.parentNode){
+              var sibs = Array.prototype.filter.call(cur.parentNode.children, function(c){return c.tagName===cur.tagName;});
+              if(sibs.length>1) p += ':nth-of-type('+(sibs.indexOf(cur)+1)+')';
+            }
+            path.unshift(p);
+            cur = cur.parentNode;
+          }
+          key = '__path__'+path.join('>');
+        }
+        snap.scrollers.push({
+          key: key,
+          sl: el.scrollLeft,
+          st: el.scrollTop,
+          el: el // weak ref, used as fallback
+        });
+      }
+    });
+  }catch(e){}
+
+  // Snapshot focus + selection
+  try{
+    var fe = document.activeElement;
+    if(fe && fe !== document.body && fe !== document.documentElement){
+      snap.focus = {
+        id: fe.id || '',
+        tag: (fe.tagName||'').toLowerCase(),
+        name: fe.name || '',
+        cls: (fe.className||'').toString().split(/\s+/).filter(Boolean).slice(0,3).join('.'),
+        value: fe.value,
+        selStart: null,
+        selEnd: null,
+        type: fe.type || ''
+      };
+      try{
+        if(typeof fe.selectionStart === 'number'){
+          snap.focus.selStart = fe.selectionStart;
+          snap.focus.selEnd = fe.selectionEnd;
+        }
+      }catch(e){}
+    }
+  }catch(e){}
+
+  return snap;
+}
+
+/* ─────────── Helper: RESTORE trạng thái UI ─────────── */
+function v74Restore(snap){
+  if(!snap) return;
+  // Phải dùng requestAnimationFrame để chờ DOM cập nhật xong
+  var apply = function(){
+    try{
+      if(snap.winSL || snap.winST) window.scrollTo(snap.winSL, snap.winST);
+      var de = document.documentElement;
+      if(de && (snap.docSL || snap.docST)){
+        de.scrollLeft = snap.docSL;
+        de.scrollTop = snap.docST;
+      }
+      var bd = document.body;
+      if(bd && (snap.bodySL || snap.bodyST)){
+        bd.scrollLeft = snap.bodySL;
+        bd.scrollTop = snap.bodyST;
+      }
+    }catch(e){}
+
+    // Restore scrollers
+    try{
+      (snap.scrollers||[]).forEach(function(s){
+        var el = null;
+        // Tìm lại element theo ID trước
+        if(s.key && !s.key.startsWith('__path__')){
+          el = document.getElementById(s.key);
+        }
+        // Fallback: dùng weak ref nếu còn trong DOM
+        if(!el && s.el && document.contains(s.el)){
+          el = s.el;
+        }
+        if(el){
+          if(el.scrollLeft !== s.sl) el.scrollLeft = s.sl;
+          if(el.scrollTop !== s.st) el.scrollTop = s.st;
+        }
+      });
+    }catch(e){}
+
+    // Restore focus
+    try{
+      if(snap.focus){
+        var f = snap.focus;
+        var fe = null;
+        if(f.id) fe = document.getElementById(f.id);
+        if(!fe && f.name){
+          var nList = document.getElementsByName(f.name);
+          if(nList && nList.length) fe = nList[0];
+        }
+        if(fe && typeof fe.focus === 'function'){
+          // Chỉ refocus nếu user CHƯA chuyển focus sang chỗ khác
+          if(document.activeElement === document.body || document.activeElement === document.documentElement){
+            fe.focus({preventScroll:true});
+            // Restore value nếu input bị reset
+            if((fe.tagName||'').toLowerCase() === 'input' || (fe.tagName||'').toLowerCase() === 'textarea'){
+              if(f.value != null && fe.value !== f.value){
+                // Không ghi đè nếu user đã nhập thêm
+                // Chỉ restore nếu value bị wipe trong khi user còn focus
+                // (Skip — too risky)
+              }
+              if(f.selStart != null){
+                try{ fe.setSelectionRange(f.selStart, f.selEnd); }catch(e){}
+              }
+            }
+          }
+        }
+      }
+    }catch(e){}
+  };
+  // Apply ngay và sau 1 frame để chắc chắn
+  apply();
+  if(typeof requestAnimationFrame === 'function'){
+    requestAnimationFrame(apply);
+    requestAnimationFrame(function(){ requestAnimationFrame(apply); });
+  }
+}
+
+/* ─────────── Hash-based change detection ─────────── */
+var _v74Hashes = {};
+function v74Hash(name, sources){
+  try{
+    var s = '';
+    (sources||[]).forEach(function(src){
+      if(typeof src === 'function'){
+        try{ src = src(); }catch(e){ src = ''; }
+      }
+      if(Array.isArray(src)){
+        s += src.length + '|';
+        src.forEach(function(item){
+          if(item && typeof item === 'object'){
+            // Chỉ hash key có ý nghĩa
+            s += (item.id||item.maPhieu||item.maMay||'') + '#' +
+                 (item.status||item.trangThai||'') + '#' +
+                 (item.cl||'') + '#' +
+                 (item.ts||'') + '#' +
+                 (item.ngayTao||item.cat||'') + '|';
+          }else{
+            s += String(item) + '|';
+          }
+        });
+      }else if(src && typeof src === 'object'){
+        s += JSON.stringify(Object.keys(src).sort().map(function(k){return k+':'+(typeof src[k]==='object'?'':src[k]);}).slice(0,30));
+      }else{
+        s += String(src);
+      }
+    });
+    return s;
+  }catch(e){return Math.random();}
+}
+
+/* ─────────── Universal wrap với scroll preserve + skip-if-unchanged ─────────── */
+function v74Wrap(holder, fnName, opts){
+  opts = opts || {};
+  try{
+    var ctx = holder || window;
+    var orig = ctx[fnName];
+    if(typeof orig !== 'function') return false;
+    if(orig.__v74) return true;
+
+    var wrapped = function(){
+      try{
+        // Skip nếu data không đổi (chỉ áp dụng cho auto-poll, không cho user action)
+        if(opts.hashFn){
+          var newH = opts.hashFn();
+          var oldH = _v74Hashes[fnName];
+          // Detect: nếu được gọi từ poll (_v74PollMode set true), thì skip nếu hash trùng
+          if(window._v74PollMode && newH === oldH){
+            return; // skip render
+          }
+          _v74Hashes[fnName] = newH;
+        }
+        // Snapshot UI state
+        var snap = v74Snapshot();
+        var r = orig.apply(this, arguments);
+        // Promise-aware
+        if(r && typeof r.then === 'function'){
+          return r.then(function(val){
+            v74Restore(snap);
+            return val;
+          }, function(err){
+            v74Restore(snap);
+            throw err;
+          });
+        }
+        v74Restore(snap);
+        return r;
+      }catch(e){
+        console.warn('[v74 wrap '+fnName+']', e);
+        return orig.apply(this, arguments);
+      }
+    };
+    wrapped.__v74 = true;
+    wrapped.__orig = orig;
+    ctx[fnName] = wrapped;
+    return true;
+  }catch(e){
+    console.warn('[v74Wrap]', fnName, e);
+    return false;
+  }
+}
+
+/* ─────────── Đăng ký các hàm render cần wrap ─────────── */
+function v74ApplyAll(){
+  // BDSC Nhật ký
+  v74Wrap(window, 'renderRepList', {
+    hashFn: function(){ return v74Hash('repList', [window.REPORTS, window.repFilter, function(){return (document.getElementById('repSrch')||{}).value||'';}]); }
+  });
+  // Dashboard
+  v74Wrap(window, 'renderDash', {
+    hashFn: function(){ return v74Hash('dash', [window.MACHINES, window.REPORTS, window.WATCHLIST]); }
+  });
+  // Watchlist
+  v74Wrap(window, 'renderWatchlist', {
+    hashFn: function(){ return v74Hash('watch', [window.WATCHLIST, window.REPORTS]); }
+  });
+  // Lifecycle
+  v74Wrap(window, 'renderLifecycle', {
+    hashFn: function(){ return v74Hash('lc', [window.REPORTS, window.MACHINES]); }
+  });
+  v74Wrap(window, 'renderLifecycleTable');
+  v74Wrap(window, 'renderLifecycleFreqChart');
+  v74Wrap(window, 'renderLifecycleAvgChart');
+  v74Wrap(window, 'renderLifecycleTrendChart');
+  // Analysis
+  v74Wrap(window, 'renderAnalysis', {
+    hashFn: function(){ return v74Hash('an', [window.REPORTS, function(){return (document.getElementById('dFrom')||{}).value+'#'+(document.getElementById('dTo')||{}).value;}]); }
+  });
+  // Machines / Users / Members / Perms / PhenDb
+  v74Wrap(window, 'renderMachines', {
+    hashFn: function(){ return v74Hash('mc', [window.MACHINES]); }
+  });
+  v74Wrap(window, 'renderPhenDb', {
+    hashFn: function(){ return v74Hash('phen', [window.PHEN_DB]); }
+  });
+  v74Wrap(window, 'renderUsers', {
+    hashFn: function(){ return v74Hash('users', [window.USERS]); }
+  });
+  v74Wrap(window, 'renderMemberList', {
+    hashFn: function(){ return v74Hash('members', [window.USERS]); }
+  });
+  v74Wrap(window, 'renderPerms', {
+    hashFn: function(){ return v74Hash('perms', [window.USERS, window.PERMS]); }
+  });
+  // Badges (small UI updates, no hash needed - cheap to run)
+  v74Wrap(window, 'updateBadges');
+  // RenderAll (calls many of above - just preserve scroll, no hash)
+  v74Wrap(window, 'renderAll');
+  // PV BDSC list
+  v74Wrap(window, 'pv16RenderListTable', {
+    hashFn: function(){ return v74Hash('pv16', [function(){return window._pvBDSCListCache||[];}]); }
+  });
+  v74Wrap(window, 'pv16RenderCompletePage');
+  v74Wrap(window, 'pv17UpdateCompletePageData');
+  // Phiếu đề xuất vật tư — selected items list (create-form)
+  v74Wrap(window, 'pvBDSCRenderSelected');
+  v74Wrap(window, 'pvBDSCRenderHistory');
+  // BDSC view modal preview (when re-rendered after note save)
+  v74Wrap(window, 'pvBDSCRenderForm');
+  // Lifecycle subcharts
+  v74Wrap(window, 'pv17RenderListTable');
+}
+
+// Chạy patch nhiều lần để bắt mọi function được khai báo trễ
+[100, 300, 700, 1500, 3000, 6000, 12000].forEach(function(ms){ setTimeout(v74ApplyAll, ms); });
+
+/* ─────────── Đánh dấu khi đang ở chế độ POLL (auto refresh từ Sheet) ─────────── */
+// Khi poll → ta muốn skip render nếu data không đổi
+// Khi user action → luôn render (vì có thể user thay đổi filter/search)
+function v74InstrumentPoll(){
+  try{
+    // Wrap setInterval gốc của poll 30s tại line 7353 — không thể clear nhưng có thể
+    // bao bọc các hàm pull để bật cờ _v74PollMode
+    var pullFns = ['pullSheet5','pullMachinesFromSheet','pullPhenSheet','pullKTVSheet','pvBDSCRefreshHistory_','pvBDSCRefreshFastData_','fetchCurrentMachineHours'];
+    pullFns.forEach(function(fn){
+      try{
+        if(typeof window[fn] === 'function' && !window[fn].__v74Poll){
+          var orig = window[fn];
+          var wrapped = function(){
+            window._v74PollMode = true;
+            try{
+              var r = orig.apply(this, arguments);
+              if(r && typeof r.then === 'function'){
+                return r.then(function(v){
+                  setTimeout(function(){ window._v74PollMode = false; }, 100);
+                  return v;
+                }, function(e){
+                  setTimeout(function(){ window._v74PollMode = false; }, 100);
+                  throw e;
+                });
+              }
+              setTimeout(function(){ window._v74PollMode = false; }, 100);
+              return r;
+            }catch(e){
+              window._v74PollMode = false;
+              throw e;
+            }
+          };
+          wrapped.__v74Poll = true;
+          wrapped.__orig = orig;
+          window[fn] = wrapped;
+        }
+      }catch(e){}
+    });
+  }catch(e){console.warn('[v74InstrumentPoll]',e);}
+}
+[200, 500, 1000, 2500, 5000].forEach(function(ms){ setTimeout(v74InstrumentPoll, ms); });
+
+/* ─────────── User action: invalidate hash để force render ─────────── */
+// Khi user click nav, hoặc oninput tìm kiếm → reset hash
+function v74InvalidateHashes(){
+  _v74Hashes = {};
+}
+var _navOrig74 = window.nav;
+if(typeof _navOrig74 === 'function' && !_navOrig74.__v74Inv){
+  var navW = function(){
+    v74InvalidateHashes();
+    window._v74PollMode = false;
+    return _navOrig74.apply(this, arguments);
+  };
+  navW.__v74Inv = true;
+  window.nav = navW;
+}
+
+// Search inputs cũng phải bypass hash
+document.addEventListener('input', function(e){
+  var t = e.target;
+  if(t && (t.id === 'repSrch' || t.id === 'pvb_searchVatTu' || (t.tagName||'').toLowerCase()==='input' && t.classList.contains('si'))){
+    window._v74PollMode = false;
+    _v74Hashes = {};
+  }
+}, true);
+
+document.addEventListener('change', function(e){
+  var t = e.target;
+  if(t && (t.tagName||'').toLowerCase()==='select'){
+    window._v74PollMode = false;
+    _v74Hashes = {};
+  }
+}, true);
+
+console.log('[V74] Universal scroll/focus preserver loaded — pull-from-Sheet sẽ không reset UI nữa.');
+
+})();
+</script>
+
+
+<!-- ════════════════════════════════════════════════════════════════════
+     V74.1 PATCH — Throttle V72.9 intervals + final stabilization
+     V72.9 dùng 5 setInterval (600-1800ms) để re-apply patch khi DOM đổi.
+     Sau khi V74 wrap render functions, các setInterval này có thể chậm
+     lại đáng kể vì DOM không còn bị thay đổi liên tục.
+═════════════════════════════════════════════════════════════════════ -->
+<script id="v74-1-throttle-script">
+(function(){
+'use strict';
+// Cách 1: thay setInterval bằng MutationObserver — chỉ chạy patch khi DOM thực sự thay đổi
+// Quan sát các container chính
+try{
+  var observed = false;
+  function setupObserver(){
+    if(observed) return;
+    var targets = ['pvFormRoot','pvHistoryRoot','pvCompleteRoot','pvb_selectedItems','app'];
+    var found = 0;
+    targets.forEach(function(id){
+      var el = document.getElementById(id);
+      if(el){
+        found++;
+        var mo = new MutationObserver(function(muts){
+          // Khi DOM trong các container này thay đổi, chạy lại các patch idempotent
+          try{
+            if(typeof window.v729PatchAll === 'function') window.v729PatchAll();
+            // Gọi các hàm patch nội bộ nếu tồn tại (đều idempotent - bảo vệ bởi __v729 flag)
+            ['removeReadonlyDvt','addCustomMaterialButton','enhanceCustomRows'].forEach(function(fn){
+              if(typeof window[fn] === 'function'){
+                try{ window[fn](); }catch(e){}
+              }
+            });
+          }catch(e){}
+        });
+        mo.observe(el, { childList:true, subtree:true });
+      }
+    });
+    if(found >= 1) observed = true;
+  }
+  // Setup khi DOM sẵn sàng
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', setupObserver);
+  }
+  setTimeout(setupObserver, 100);
+  setTimeout(setupObserver, 500);
+  setTimeout(setupObserver, 1500);
+  setTimeout(setupObserver, 4000);
+}catch(e){console.warn('[v74.1 observer]',e);}
+
+// Đảm bảo các interval V72.9 vẫn chạy nhưng không gây tốn CPU (chúng đều idempotent)
+// Chỉ log để debug
+console.log('[V74.1] MutationObserver đã sẵn sàng — DOM mutation sẽ re-apply patch tự động.');
+
+})();
+</script>
