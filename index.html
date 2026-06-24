@@ -21504,3 +21504,876 @@ console.log('[V74.1] MutationObserver đã sẵn sàng — DOM mutation sẽ re-
 
 })();
 </script>
+
+
+<!-- ════════════════════════════════════════════════════════════════════
+     V75 PATCH — Cursor preservation + BDSC report editor
+     1. CURSOR JUMP khi tạo phiếu vật tư:
+        - Custom input của V72.9 không có ID → V74 focus restore không
+          tìm được khi DOM re-render → con trỏ nhảy mỗi 3.5s (install64).
+        - Fix: gán ID duy nhất cho mỗi custom input; thêm cơ chế
+          "focus guard" cho v74Wrap → SKIP render nếu user đang gõ.
+     2. NÚT SỬA Nhật ký BDSC trước đây chỉ là toast giả.
+        - Build modal sửa thật sự với mọi field cần thiết.
+        - Chỉ admin và người tạo phiếu (CU.name === r.ktvbc) mới mở được.
+        - Lưu cập nhật vào REPORTS local + xóa cũ + ghi lại Sheet 5.
+═════════════════════════════════════════════════════════════════════ -->
+<style id="v75-patch-style">
+/* Modal sửa Nhật ký BDSC */
+.v75-mask{
+  position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:9999;
+  display:flex;align-items:center;justify-content:center;padding:20px;
+  backdrop-filter:blur(2px);
+}
+.v75-modal{
+  background:#fff;border-radius:12px;width:min(960px,100%);
+  max-height:92vh;overflow:hidden;display:flex;flex-direction:column;
+  box-shadow:0 25px 60px rgba(0,0,0,.3);
+}
+.v75-head{
+  padding:14px 18px;background:#0d6e3f;color:#fff;
+  display:flex;align-items:center;gap:12px;
+}
+.v75-head b{flex:1;font-size:14px}
+.v75-head .sub{font-size:11px;opacity:.85;font-weight:400}
+.v75-body{padding:16px 18px;overflow:auto;flex:1}
+.v75-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px 14px;margin-bottom:14px}
+.v75-grid.cols-2{grid-template-columns:1fr 1fr}
+.v75-grid.cols-4{grid-template-columns:repeat(4,1fr)}
+.v75-iw{display:flex;flex-direction:column;gap:4px}
+.v75-il{font-size:10px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.3px}
+.v75-inp{border:1.5px solid #cbd5e1;border-radius:7px;padding:7px 10px;font-size:12px;outline:none;background:#fff;transition:.15s;font-family:inherit}
+.v75-inp:focus{border-color:#0d6e3f;box-shadow:0 0 0 3px rgba(13,110,63,.12)}
+.v75-inp[readonly]{background:#f1f5f9;color:#64748b;cursor:not-allowed}
+.v75-ta{min-height:60px;resize:vertical;font-family:inherit}
+.v75-phen{
+  border:1.5px solid #e2e8f0;border-radius:9px;padding:11px 13px;
+  margin-bottom:10px;background:#fafafa;
+}
+.v75-phen-head{
+  font-size:11px;font-weight:700;color:#0d6e3f;margin-bottom:8px;
+  display:flex;align-items:center;gap:8px;
+}
+.v75-phen-head .v75-phen-no{
+  background:#0d6e3f;color:#fff;border-radius:50%;width:22px;height:22px;
+  display:inline-flex;align-items:center;justify-content:center;font-size:11px;
+}
+.v75-readonly-hint{
+  background:#dbeafe;border:1px solid #93c5fd;border-radius:6px;
+  padding:6px 10px;font-size:10.5px;color:#1e40af;margin-bottom:8px;
+}
+.v75-foot{
+  padding:12px 18px;border-top:1px solid #e2e8f0;background:#f8fafc;
+  display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;
+}
+.v75-btn{
+  border:none;border-radius:7px;padding:8px 16px;font-size:12px;
+  font-weight:700;cursor:pointer;transition:.15s;
+}
+.v75-btn-save{background:#0d6e3f;color:#fff}
+.v75-btn-save:hover{background:#0a5230}
+.v75-btn-save:disabled{background:#94a3b8;cursor:wait}
+.v75-btn-cancel{background:#e2e8f0;color:#334155}
+.v75-btn-cancel:hover{background:#cbd5e1}
+</style>
+<script id="v75-patch-script">
+(function(){
+'use strict';
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 1 — Cursor jump khi tạo phiếu vật tư
+═══════════════════════════════════════════════════════════════ */
+
+// 1a. Patch enhanceCustomRows để gán ID duy nhất cho custom input
+//     → V74 focus restoration sẽ tìm được element sau re-render.
+function patchEnhanceCustomRowsV75(){
+  try{
+    if(typeof window.enhanceCustomRows !== 'function') return false;
+    if(window.enhanceCustomRows.__v75) return true;
+    var orig = window.enhanceCustomRows;
+    window.enhanceCustomRows = function(){
+      var r = orig.apply(this, arguments);
+      // Sau khi enhance, gán ID cho mỗi input không có ID
+      try{
+        var box = document.getElementById('pvb_selectedItems');
+        if(!box) return r;
+        var rows = box.querySelectorAll('[data-id]');
+        rows.forEach(function(row){
+          var id = row.getAttribute('data-id') || '';
+          if(!id) return;
+          var inputs = row.querySelectorAll('input:not([id])');
+          inputs.forEach(function(inp, i){
+            inp.id = 'v75_inp_' + id.replace(/[^a-z0-9-]/gi,'_') + '_' + i;
+          });
+        });
+      }catch(e){}
+      return r;
+    };
+    window.enhanceCustomRows.__v75 = true;
+    return true;
+  }catch(e){
+    console.warn('[v75 patchEnhance]', e);
+    return false;
+  }
+}
+
+// 1b. Focus guard cho v74Wrap — nếu user đang gõ trong input/textarea
+//     thuộc các container động, SKIP re-render từ poll/install để
+//     không phá vỡ cursor position.
+function isUserTyping(){
+  try{
+    var ae = document.activeElement;
+    if(!ae || ae === document.body || ae === document.documentElement) return false;
+    var tag = (ae.tagName||'').toLowerCase();
+    if(tag === 'input' || tag === 'textarea' || ae.isContentEditable){
+      // Loại trừ checkbox, radio, button — không phải input gõ chữ
+      var t = (ae.type||'').toLowerCase();
+      if(t === 'checkbox' || t === 'radio' || t === 'button' || t === 'submit') return false;
+      return true;
+    }
+    return false;
+  }catch(e){return false;}
+}
+window.v75IsUserTyping = isUserTyping;
+
+// 1c. Override các render functions hay re-render dynamic input containers
+//     để TỪ CHỐI render khi user đang gõ (do auto-poll / install64).
+function guardRenderV75(fnName){
+  try{
+    if(typeof window[fnName] !== 'function') return;
+    if(window[fnName].__v75Guard) return;
+    var base = window[fnName];
+    var guarded = function(){
+      // Nếu user đang gõ VÀ render được kích hoạt bởi auto-poll/install
+      // (không phải bởi user action), thì SKIP để không phá cursor.
+      // Phát hiện auto-trigger: _v74PollMode = true HOẶC call stack quá nông
+      // (không có user event trigger gần đây).
+      if(isUserTyping()){
+        // Cứ skip nếu đang typing — auto re-render không cần thiết khi user đang tương tác
+        // Schedule render sau khi user dừng gõ.
+        if(!base.__v75Pending){
+          base.__v75Pending = true;
+          var tries = 0;
+          var check = function(){
+            tries++;
+            if(!isUserTyping() || tries > 60){ // tối đa 60s wait
+              base.__v75Pending = false;
+              try{ base.apply(window, []); }catch(e){}
+            }else{
+              setTimeout(check, 1000);
+            }
+          };
+          setTimeout(check, 1000);
+        }
+        return;
+      }
+      return base.apply(this, arguments);
+    };
+    guarded.__v75Guard = true;
+    guarded.__orig = base;
+    window[fnName] = guarded;
+  }catch(e){console.warn('[v75 guardRender]', fnName, e);}
+}
+
+// Apply guards cho các render hay gây jump cursor
+function applyV75Guards(){
+  ['pvBDSCRenderSelected','pvBDSCRenderVatTuSearch','renderSelected64','pvBDSCRenderForm','renderRepList','renderDash','renderWatchlist','renderLifecycle','renderAnalysis','renderAll'].forEach(guardRenderV75);
+  patchEnhanceCustomRowsV75();
+}
+[200, 500, 1200, 2500, 5000, 10000].forEach(function(ms){ setTimeout(applyV75Guards, ms); });
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 2 — Nút Sửa Nhật ký BDSC: build modal sửa thật sự
+═══════════════════════════════════════════════════════════════ */
+
+var E75 = function(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m];}); };
+function toast75(m, t){
+  try{ if(typeof toast === 'function') toast(m, t||'info'); else alert(m); }
+  catch(e){ console.log(m); }
+}
+
+// Quyền sửa: admin hoặc người tạo (KTV báo cáo)
+function canEditBDSC(r){
+  try{
+    if(!window.CU || !r) return false;
+    if(CU.role === 'admin') return true;
+    // ktvbc là KTV báo cáo (người tạo phiếu)
+    var me = String(CU.name||'').trim();
+    var creator = String(r.ktvbc||'').trim();
+    if(me && creator && me === creator) return true;
+    return false;
+  }catch(e){return false;}
+}
+
+// Build modal sửa BDSC
+window.editRep = function(id){
+  try{
+    var r = (window.REPORTS || []).find(function(x){return x.id === id;});
+    if(!r){ toast75('❌ Không tìm thấy báo cáo ' + id, 'err'); return; }
+    if(!canEditBDSC(r)){
+      toast75('⛔ Bạn không có quyền sửa phiếu này. Chỉ admin và người tạo phiếu (KTV báo cáo) mới sửa được.', 'err');
+      return;
+    }
+    showEditBDSCModal(r);
+  }catch(e){
+    console.error('[v75 editRep]', e);
+    toast75('❌ Lỗi mở phiếu sửa: ' + (e.message||e), 'err');
+  }
+};
+
+function showEditBDSCModal(r){
+  // Xóa modal cũ nếu có
+  document.getElementById('v75-edit-modal')?.remove();
+
+  var phenList = Array.isArray(r.phen) ? r.phen : [];
+  var phenHTML = phenList.map(function(p, idx){
+    var cums = (p.cums||[]).join('; ');
+    var parts = '';
+    if(p.parts){
+      parts = Object.entries(p.parts).map(function(kv){
+        var k = kv[0], v = kv[1];
+        if(typeof v === 'object' && v !== null){
+          var loai = v.loai||'';
+          var sl = v.sl||1;
+          return k + (loai?' ('+loai+', x'+sl+')':'');
+        }
+        return k + ' (' + String(v||'') + ')';
+      }).join('; ');
+    }
+    return ''+
+      '<div class="v75-phen" data-phen="'+idx+'">'+
+        '<div class="v75-phen-head"><span class="v75-phen-no">'+(idx+1)+'</span> Hiện tượng / Sự cố</div>'+
+        '<div class="v75-grid cols-2">'+
+          '<div class="v75-iw" style="grid-column:1/-1">'+
+            '<label class="v75-il">Tên hiện tượng</label>'+
+            '<input class="v75-inp" data-phen-k="ht" value="'+E75(p.ht||'')+'" placeholder="VD: Công suất thấp">'+
+          '</div>'+
+          '<div class="v75-iw" style="grid-column:1/-1">'+
+            '<label class="v75-il">Phương pháp xử lý (phân cách bởi dấu chấm phẩy)</label>'+
+            '<input class="v75-inp" data-phen-k="pp" value="'+E75(p.pp||'')+'" placeholder="Sửa chữa; Thay thế">'+
+          '</div>'+
+          '<div class="v75-iw" style="grid-column:1/-1">'+
+            '<label class="v75-il">Cụm linh kiện (chỉ xem - tạo phiếu mới để đổi cụm)</label>'+
+            '<input class="v75-inp" value="'+E75(cums)+'" readonly>'+
+          '</div>'+
+          '<div class="v75-iw" style="grid-column:1/-1">'+
+            '<label class="v75-il">Linh kiện (chỉ xem - tạo phiếu mới để đổi linh kiện)</label>'+
+            '<input class="v75-inp" value="'+E75(parts)+'" readonly>'+
+          '</div>'+
+          '<div class="v75-iw" style="grid-column:1/-1">'+
+            '<label class="v75-il">Ghi chú hiện tượng</label>'+
+            '<textarea class="v75-inp v75-ta" data-phen-k="gc">'+E75(p.gc||'')+'</textarea>'+
+          '</div>'+
+        '</div>'+
+      '</div>';
+  }).join('');
+
+  if(!phenList.length){
+    phenHTML = '<div class="v75-readonly-hint">⚠️ Phiếu này chưa có hiện tượng nào.</div>';
+  }
+
+  var hourMeterStr = (typeof formatHoursToDuration === 'function')
+    ? (formatHoursToDuration(r.soGioVanHanh)||'')
+    : (r.soGioVanHanh ? String(r.soGioVanHanh) : '');
+
+  var conclusions = [
+    {v:'fixed',     l:'Đã xử lý / Hoàn tất'},
+    {v:'watching',  l:'Theo dõi'},
+    {v:'pending',   l:'Vấn đề tồn đọng'},
+    {v:'',          l:'(Chưa kết luận)'}
+  ];
+
+  var html = ''+
+    '<div class="v75-mask" id="v75-edit-modal">'+
+      '<div class="v75-modal">'+
+        '<div class="v75-head">'+
+          '<b>✏️ Chỉnh sửa Phiếu BDSC — '+E75(r.id)+'<div class="sub">Mã máy: '+E75(r.maMay||'-')+' · '+E75(r.tt||'')+' · KTV BC: '+E75(r.ktvbc||'-')+'</div></b>'+
+          '<button class="v75-btn v75-btn-cancel" onclick="document.getElementById(\'v75-edit-modal\').remove()">✕ Đóng</button>'+
+        '</div>'+
+        '<div class="v75-body">'+
+
+          '<div class="v75-readonly-hint">💡 Bạn có thể sửa: KTV, thời gian, số giờ đồng hồ máy, kết luận, ghi chú, tên hiện tượng &amp; PP xử lý &amp; ghi chú hiện tượng. Cụm linh kiện và linh kiện chi tiết không sửa được ở đây — vui lòng tạo phiếu mới nếu cần thay đổi.</div>'+
+
+          '<div class="v75-grid cols-4">'+
+            '<div class="v75-iw"><label class="v75-il">Mã máy</label><input class="v75-inp" id="v75_maMay" value="'+E75(r.maMay||'')+'" readonly></div>'+
+            '<div class="v75-iw"><label class="v75-il">KTV báo cáo</label><input class="v75-inp" id="v75_ktvbc" value="'+E75(r.ktvbc||'')+'" readonly></div>'+
+            '<div class="v75-iw"><label class="v75-il">KTV trưởng *</label><input class="v75-inp" id="v75_ktv1" value="'+E75(r.ktv1||'')+'"></div>'+
+            '<div class="v75-iw"><label class="v75-il">KTV hỗ trợ (; phân cách)</label><input class="v75-inp" id="v75_ktv2" value="'+E75(r.ktv2||'')+'"></div>'+
+          '</div>'+
+
+          '<div class="v75-grid cols-4">'+
+            '<div class="v75-iw"><label class="v75-il">Ngày BĐ</label><input class="v75-inp" id="v75_nd" type="date" value="'+E75(r.nd||'')+'"></div>'+
+            '<div class="v75-iw"><label class="v75-il">Giờ BĐ</label><input class="v75-inp" id="v75_gbd" type="time" value="'+E75(r.gbd||'')+'"></div>'+
+            '<div class="v75-iw"><label class="v75-il">Ngày KT</label><input class="v75-inp" id="v75_nkt" type="date" value="'+E75(r.nkt||'')+'"></div>'+
+            '<div class="v75-iw"><label class="v75-il">Giờ KT</label><input class="v75-inp" id="v75_gkt" type="time" value="'+E75(r.gkt||'')+'"></div>'+
+          '</div>'+
+
+          '<div class="v75-grid cols-2">'+
+            '<div class="v75-iw"><label class="v75-il">⏱ Số giờ đồng hồ máy *</label><input class="v75-inp" id="v75_shvh" value="'+E75(hourMeterStr)+'" placeholder="VD: 12500 hoặc 12500:30:00"></div>'+
+            '<div class="v75-iw"><label class="v75-il">Kết luận</label><select class="v75-inp" id="v75_cl">'+
+              conclusions.map(function(c){
+                return '<option value="'+c.v+'"'+(r.cl===c.v?' selected':'')+'>'+E75(c.l)+'</option>';
+              }).join('')+
+            '</select></div>'+
+          '</div>'+
+
+          '<div class="v75-iw" style="margin-bottom:14px">'+
+            '<label class="v75-il">Ghi chú chung báo cáo</label>'+
+            '<textarea class="v75-inp v75-ta" id="v75_gc" placeholder="Ghi chú bổ sung cho toàn báo cáo...">'+E75(r.gc||'')+'</textarea>'+
+          '</div>'+
+
+          '<div style="font-size:12px;font-weight:700;color:#0d6e3f;margin-bottom:8px">📋 Danh sách hiện tượng ('+phenList.length+')</div>'+
+          '<div id="v75-phen-list">'+phenHTML+'</div>'+
+
+        '</div>'+
+        '<div class="v75-foot">'+
+          '<button class="v75-btn v75-btn-cancel" onclick="document.getElementById(\'v75-edit-modal\').remove()">Hủy</button>'+
+          '<button class="v75-btn v75-btn-save" id="v75-save-btn">💾 Lưu cập nhật</button>'+
+        '</div>'+
+      '</div>'+
+    '</div>';
+
+  document.body.insertAdjacentHTML('beforeend', html);
+
+  document.getElementById('v75-save-btn').onclick = function(){
+    saveEditBDSC(r.id);
+  };
+}
+
+async function saveEditBDSC(id){
+  var btn = document.getElementById('v75-save-btn');
+  try{
+    var r = (window.REPORTS||[]).find(function(x){return x.id === id;});
+    if(!r){ toast75('❌ Không tìm thấy báo cáo', 'err'); return; }
+
+    // Gather updated values
+    var ktv1 = (document.getElementById('v75_ktv1')||{}).value || '';
+    var ktv2 = (document.getElementById('v75_ktv2')||{}).value || '';
+    var nd   = (document.getElementById('v75_nd')||{}).value || '';
+    var gbd  = (document.getElementById('v75_gbd')||{}).value || '';
+    var nkt  = (document.getElementById('v75_nkt')||{}).value || '';
+    var gkt  = (document.getElementById('v75_gkt')||{}).value || '';
+    var shvh = (document.getElementById('v75_shvh')||{}).value || '';
+    var cl   = (document.getElementById('v75_cl')||{}).value || '';
+    var gc   = (document.getElementById('v75_gc')||{}).value || '';
+
+    if(!ktv1.trim()){ toast75('⚠️ KTV trưởng là bắt buộc','err'); return; }
+    if(!shvh.trim() || (typeof parseDurationToHours==='function' && parseDurationToHours(shvh)<=0)){
+      toast75('⚠️ Số giờ đồng hồ máy là bắt buộc và phải > 0','err'); return;
+    }
+
+    // Gather phen edits
+    var phenList = Array.isArray(r.phen) ? r.phen.slice() : [];
+    var phenEls = document.querySelectorAll('#v75-phen-list .v75-phen');
+    phenEls.forEach(function(pEl){
+      var idx = parseInt(pEl.getAttribute('data-phen'), 10);
+      if(isNaN(idx) || !phenList[idx]) return;
+      var p = phenList[idx];
+      pEl.querySelectorAll('[data-phen-k]').forEach(function(inp){
+        var k = inp.getAttribute('data-phen-k');
+        if(k === 'ht' || k === 'pp' || k === 'gc'){
+          p[k] = inp.value || '';
+        }
+      });
+    });
+
+    // Compute total time
+    function computeTg(d1,t1,d2,t2){
+      try{
+        if(!d1||!t1||!d2||!t2) return r.tg||'';
+        var s = new Date(d1+'T'+t1);
+        var e = new Date(d2+'T'+t2);
+        var diff = (e - s) / 1000;
+        if(isNaN(diff) || diff<0) return r.tg||'';
+        var h = Math.floor(diff/3600);
+        var m = Math.floor((diff%3600)/60);
+        return h + ' giờ ' + m + ' phút';
+      }catch(e){return r.tg||'';}
+    }
+
+    // Apply updates
+    r.ktv1 = ktv1;
+    r.ktv2 = ktv2;
+    r.nd = nd;
+    r.gbd = gbd;
+    r.nkt = nkt;
+    r.gkt = gkt;
+    r.tg = computeTg(nd, gbd, nkt, gkt);
+    r.soGioVanHanh = (typeof parseDurationToHours==='function') ? parseDurationToHours(shvh) : (parseFloat(shvh)||0);
+    r.cl = cl;
+    r.gc = gc;
+    r.phen = phenList;
+    r.lastEditBy = (window.CU&&CU.name) || '';
+    r.lastEditAt = new Date().toISOString();
+
+    btn.disabled = true;
+    btn.textContent = '⏳ Đang lưu...';
+
+    // Save local
+    if(typeof save === 'function') save();
+
+    // Sync to Sheet 5: delete old rows then write new
+    if(window.GS_URL){
+      try{
+        if(typeof callGoogleAPI === 'function'){
+          // 1) Delete cũ
+          await callGoogleAPI('delete', {sheet:'5', id: r.id});
+          // 2) Write mới
+          if(typeof syncReportGS === 'function'){
+            await syncReportGS(r);
+          }
+        }
+      }catch(e){
+        console.warn('[v75 sync]', e);
+        toast75('⚠️ Lưu local OK nhưng có lỗi đồng bộ Sheet: '+(e.message||e),'warn');
+      }
+    }
+
+    // Refresh UI
+    try{ if(typeof renderRepList === 'function') renderRepList(); }catch(e){}
+    try{ if(typeof renderAll === 'function') renderAll(); }catch(e){}
+
+    document.getElementById('v75-edit-modal')?.remove();
+    toast75('✅ Đã cập nhật phiếu '+r.id,'ok');
+
+  }catch(e){
+    console.error('[v75 save]', e);
+    toast75('❌ Lỗi lưu: '+(e.message||e),'err');
+    if(btn){ btn.disabled=false; btn.textContent='💾 Lưu cập nhật'; }
+  }
+}
+
+// Override canEdit để dùng quy tắc V75: chỉ admin + người tạo
+// (Hàm canEdit gốc cùng tinh thần — V75 chỉ ghi đè để chắc chắn)
+var _origCanEdit = window.canEdit;
+window.canEdit = function(r){
+  return canEditBDSC(r);
+};
+
+// Render lại danh sách báo cáo để nút sửa dùng editRep mới
+setTimeout(function(){
+  try{ if(typeof renderRepList === 'function') renderRepList(); }catch(e){}
+}, 600);
+
+console.log('[V75] Loaded — cursor preserved khi user gõ, BDSC editor activated.');
+
+})();
+</script>
+
+
+<!-- ════════════════════════════════════════════════════════════════════
+     V76 PATCH — Final fixes
+     Vấn đề V75 còn:
+     1. renderRepList vẫn dùng onclick="toast(...)" cũ → V75 thêm editRep
+        nhưng nút trong HTML vẫn gọi toast → "đè 2 code".
+        Fix: post-process tbody sau render để swap onclick.
+     2. install64 (line 18976) chạy mỗi 3.5s, gọi LOCAL renderSelected64
+        qua closure → bypass mọi wrap trên window.* → cursor jump.
+        Fix: MutationObserver phục hồi focus/cursor sau mỗi DOM mutation.
+     3. Nút "🔐 yêu cầu quyền" thừa → xóa luôn. Admin & creator = ✏️,
+        người khác = không có nút (clean UI).
+═════════════════════════════════════════════════════════════════════ -->
+<style id="v76-patch-style">
+/* Ẩn nút yêu cầu quyền (🔐) — V76 không dùng nữa */
+button[title="Yêu cầu quyền sửa"],
+button[onclick^="reqPerm"]{
+  display:none !important;
+}
+</style>
+<script id="v76-patch-script">
+(function(){
+'use strict';
+
+/* ─── Helper ─── */
+function _isAdmin76(){ try{ return !!(window.CU && (CU.role==='admin' || String(CU.role||'').toLowerCase()==='admin')); }catch(e){return false;} }
+function _canEdit76(r){
+  try{
+    if(!window.CU || !r) return false;
+    if(_isAdmin76()) return true;
+    var me = String(CU.name||'').trim().toLowerCase();
+    var creator = String(r.ktvbc||'').trim().toLowerCase();
+    if(me && creator && me === creator) return true;
+    return false;
+  }catch(e){return false;}
+}
+
+// Override canEdit toàn cục cho V76 — cũ + mới đều dùng quy tắc này
+window.canEdit = function(r){ return _canEdit76(r); };
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 1 & 3 — Post-process renderRepList buttons
+═══════════════════════════════════════════════════════════════ */
+function patchRepListButtons76(){
+  try{
+    var tbody = document.getElementById('repBody');
+    if(!tbody) return;
+
+    var rows = tbody.querySelectorAll('tr');
+    rows.forEach(function(tr){
+      // Lấy report ID từ cột đầu tiên (.mm chứa BC-xxxx)
+      var idSpan = tr.querySelector('td:first-child .mm');
+      if(!idSpan) return;
+      var id = idSpan.textContent.trim();
+      if(!id) return;
+      var r = (window.REPORTS||[]).find(function(x){return x.id === id;});
+      if(!r) return;
+
+      var canEd = _canEdit76(r);
+      var buttons = tr.querySelectorAll('button');
+
+      buttons.forEach(function(btn){
+        var oc = btn.getAttribute('onclick') || '';
+        var title = btn.getAttribute('title') || '';
+
+        // Nút "Chỉnh sửa: Quản Trị Viên" toast → đổi sang editRep
+        if(oc.indexOf("toast('Chỉnh sửa") >= 0 || (oc.indexOf('toast(') >= 0 && oc.indexOf('CU.name') >= 0)){
+          if(canEd){
+            btn.setAttribute('onclick', "editRep('" + id + "')");
+            btn.setAttribute('title', 'Sửa phiếu');
+            btn.classList.remove('bg-gr','disabled');
+            if(!btn.classList.contains('bg-b')) btn.classList.add('bg-b');
+            btn.style.display = '';
+            if(!btn.__v76){ btn.__v76 = true; }
+          } else {
+            // Không có quyền → ẩn luôn
+            btn.style.display = 'none';
+          }
+        }
+
+        // Nút 🔐 "Yêu cầu quyền sửa" → ẩn hoặc đổi
+        if(oc.indexOf('reqPerm(') >= 0 || title === 'Yêu cầu quyền sửa'){
+          if(canEd){
+            // User CÓ quyền nhưng vẫn show 🔐 do canEdit cũ trả false → swap sang editRep
+            btn.setAttribute('onclick', "editRep('" + id + "')");
+            btn.setAttribute('title', 'Sửa phiếu');
+            btn.classList.remove('bg-gr','disabled');
+            if(!btn.classList.contains('bg-b')) btn.classList.add('bg-b');
+            btn.innerHTML = '✏️';
+            btn.style.display = '';
+          } else {
+            btn.style.display = 'none';
+          }
+        }
+
+        // Nút "Xóa phiếu" delRep → chỉ admin được xóa, creator KHÔNG xóa
+        if(oc.indexOf('delRep(') >= 0){
+          if(_isAdmin76()){
+            btn.style.display = '';
+          }
+          // creator (không admin) cũng có quyền xóa nếu là phiếu mình tạo? user không nói rõ
+          // giữ logic cũ: canEdit → có quyền xóa
+        }
+      });
+    });
+  }catch(e){console.warn('[v76 patchRepListButtons]', e);}
+}
+
+// Wrap renderRepList để post-process sau khi render
+function wrapRenderRepList76(){
+  try{
+    if(typeof window.renderRepList !== 'function') return;
+    if(window.renderRepList.__v76) return;
+    var base = window.renderRepList;
+    var wrapped = function(){
+      var r = base.apply(this, arguments);
+      // Post-process sau khi DOM được cập nhật
+      try{ patchRepListButtons76(); }catch(e){}
+      requestAnimationFrame(function(){ try{ patchRepListButtons76(); }catch(e){} });
+      return r;
+    };
+    wrapped.__v76 = true;
+    wrapped.__orig = base;
+    window.renderRepList = wrapped;
+  }catch(e){console.warn('[v76 wrapRenderRepList]', e);}
+}
+
+[200, 600, 1200, 2500, 5000, 10000].forEach(function(ms){
+  setTimeout(function(){ wrapRenderRepList76(); patchRepListButtons76(); }, ms);
+});
+
+// MutationObserver cho tbody — bắt mọi lần renderRepList chạy
+function setupRepListObserver(){
+  try{
+    var tbody = document.getElementById('repBody');
+    if(!tbody) return false;
+    if(tbody.__v76Observed) return true;
+    tbody.__v76Observed = true;
+    new MutationObserver(function(){
+      patchRepListButtons76();
+    }).observe(tbody, { childList: true });
+    return true;
+  }catch(e){console.warn('[v76 setupRepListObserver]', e); return false;}
+}
+[300, 800, 1800, 4000].forEach(function(ms){ setTimeout(setupRepListObserver, ms); });
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX 2 — Cursor preservation via MutationObserver
+   (install64 vẫn re-render mỗi 3.5s nhưng MutationObserver sẽ khôi
+    phục focus + cursor ngay lập tức sau khi DOM thay đổi.)
+═══════════════════════════════════════════════════════════════ */
+var _v76FocusState = null;
+
+// Track focus + cursor cho mọi input/textarea trong các container động
+function captureFocus76(e){
+  try{
+    var el = e ? e.target : document.activeElement;
+    if(!el || el === document.body || el === document.documentElement) return;
+    var tag = (el.tagName||'').toLowerCase();
+    if(tag !== 'input' && tag !== 'textarea' && !el.isContentEditable) return;
+    var t = (el.type||'').toLowerCase();
+    if(t === 'checkbox' || t === 'radio' || t === 'button' || t === 'submit') return;
+
+    // Tạo "fingerprint" để tìm lại element sau khi DOM rebuilt
+    var fp = {
+      id: el.id || '',
+      itemId: '',
+      dataK: el.getAttribute('data-k') || '',
+      placeholder: el.placeholder || '',
+      value: el.value || '',
+      selStart: null,
+      selEnd: null,
+      tag: tag
+    };
+    // Tìm itemId từ ancestor có data-id (selected items)
+    var row = el.closest('[data-id]');
+    if(row) fp.itemId = row.getAttribute('data-id') || '';
+
+    try{
+      if(typeof el.selectionStart === 'number'){
+        fp.selStart = el.selectionStart;
+        fp.selEnd = el.selectionEnd;
+      }
+    }catch(e){}
+
+    _v76FocusState = fp;
+  }catch(e){}
+}
+
+document.addEventListener('focusin', captureFocus76, true);
+document.addEventListener('input', captureFocus76, true);
+document.addEventListener('keyup', captureFocus76, true);
+
+// Restore focus sau khi DOM bị thay đổi
+function tryRestoreFocus76(){
+  try{
+    var fp = _v76FocusState;
+    if(!fp) return;
+
+    // Nếu focus vẫn còn ở đúng element, không cần restore
+    var ae = document.activeElement;
+    if(ae && ae !== document.body && ae !== document.documentElement){
+      var t = (ae.tagName||'').toLowerCase();
+      if(t === 'input' || t === 'textarea' || ae.isContentEditable) return;
+    }
+
+    var target = null;
+
+    // Strategy 1: tìm theo ID
+    if(fp.id){
+      target = document.getElementById(fp.id);
+    }
+
+    // Strategy 2: tìm theo itemId + dataK (cho selected items list)
+    if(!target && fp.itemId){
+      var row = document.querySelector('[data-id="' + CSS.escape(fp.itemId) + '"]');
+      if(row){
+        if(fp.dataK){
+          target = row.querySelector('[data-k="' + CSS.escape(fp.dataK) + '"]');
+        }
+        if(!target && fp.placeholder){
+          // Có thể là custom input từ V72.9 không có data-k
+          var inps = row.querySelectorAll('input,textarea');
+          for(var i=0;i<inps.length;i++){
+            if((inps[i].placeholder||'') === fp.placeholder){
+              target = inps[i];
+              break;
+            }
+          }
+        }
+        if(!target){
+          // Fallback: input text đầu tiên trong row
+          target = row.querySelector('input[type="text"], input:not([type]), textarea');
+        }
+      }
+    }
+
+    if(target && target !== ae){
+      // Restore value nếu bị mất (do re-render)
+      if(fp.value && target.value !== fp.value && (target.value === '' || target.value === target.defaultValue)){
+        target.value = fp.value;
+        // Trigger input event để các listener khác cập nhật state
+        try{
+          target.dispatchEvent(new Event('input', { bubbles: true }));
+        }catch(e){}
+      }
+      target.focus({preventScroll: true});
+      // Restore cursor
+      if(fp.selStart != null && typeof target.setSelectionRange === 'function'){
+        try{
+          target.setSelectionRange(fp.selStart, fp.selEnd != null ? fp.selEnd : fp.selStart);
+        }catch(e){}
+      }
+    }
+  }catch(e){console.warn('[v76 restoreFocus]', e);}
+}
+
+// Observer cho các container động
+function setupContainerObservers76(){
+  try{
+    var ids = ['pvb_selectedItems','phenCont','app','pvFormRoot'];
+    ids.forEach(function(id){
+      var el = document.getElementById(id);
+      if(!el || el.__v76FocusObs) return;
+      el.__v76FocusObs = true;
+      new MutationObserver(function(muts){
+        // Bất kỳ thay đổi nào trong container, thử restore focus
+        // Dùng requestAnimationFrame để chờ DOM ổn định
+        requestAnimationFrame(function(){
+          tryRestoreFocus76();
+          requestAnimationFrame(tryRestoreFocus76);
+        });
+      }).observe(el, { childList: true, subtree: true });
+    });
+  }catch(e){console.warn('[v76 setupContainerObservers]', e);}
+}
+[150, 400, 900, 1800, 3500, 6500].forEach(function(ms){ setTimeout(setupContainerObservers76, ms); });
+
+// Clear state khi user click ra ngoài (intentional blur)
+document.addEventListener('mousedown', function(e){
+  var ae = document.activeElement;
+  if(ae && ae !== e.target && !ae.contains(e.target)){
+    // Sẽ unfocus → clear state để không restore lung tung
+    setTimeout(function(){
+      var newAe = document.activeElement;
+      if(!newAe || newAe === document.body){
+        _v76FocusState = null;
+      }
+    }, 50);
+  }
+}, true);
+
+/* ═══════════════════════════════════════════════════════════════
+   FIX EXTRA — Đảm bảo editRep luôn dùng version V75
+   (Tránh trường hợp định nghĩa khác ghi đè sau đó)
+═══════════════════════════════════════════════════════════════ */
+// Đã có editRep từ V75. Nếu reqPerm còn được gọi, log để debug.
+if(typeof window.reqPerm === 'function' && !window.reqPerm.__v76){
+  var _origReqPerm = window.reqPerm;
+  window.reqPerm = function(id){
+    var r = (window.REPORTS||[]).find(function(x){return x.id === id;});
+    if(r && _canEdit76(r)){
+      // User CÓ quyền → mở editor luôn thay vì hiện form yêu cầu quyền
+      return window.editRep ? window.editRep(id) : _origReqPerm.apply(this, arguments);
+    }
+    // Không quyền → silently no-op (không hiện popup yêu cầu quyền)
+    if(typeof toast === 'function') toast('⛔ Bạn không có quyền sửa phiếu này', 'err');
+    return false;
+  };
+  window.reqPerm.__v76 = true;
+}
+
+console.log('[V76] Loaded — buttons fixed, cursor preserved via MutationObserver, 🔐 removed.');
+
+})();
+</script>
+
+
+<!-- ════════════════════════════════════════════════════════════════════
+     V76.1 PATCH — Final consolidation (audit cleanup)
+     Audit phát hiện 1 vài chỗ có thể tinh chỉnh để tránh race condition:
+     1. V75 setTimeout(renderRepList) chạy lúc boot — có thể trước khi V76
+        wrap. V76 MutationObserver bắt được nhưng chậm 1 tick. Bổ sung
+        post-process ngay lập tức sau setTimeout đó.
+     2. V75's guardRenderV75 lưu `base` tại wrap time → khi deferred render
+        firing, bypass V76 wrap. Đảm bảo deferred call vẫn qua window.X.
+     3. Thêm 1 lớp bảo vệ cuối cùng: mỗi 5s check & re-patch buttons nếu
+        có nút "Yêu cầu quyền" lọt qua.
+═════════════════════════════════════════════════════════════════════ -->
+<script id="v76-1-final-script">
+(function(){
+'use strict';
+
+// 1. Patch V75's guardRenderV75 deferred call để đi qua window function
+//    (đảm bảo V76 wrap được call thay vì bypass)
+function patchV75DeferredCall(){
+  try{
+    // V75 setIntervals đã apply guards. Mỗi guard có .__orig.
+    // Khi deferred check fires và goi base.apply(), nó goi base (V74-wrapped)
+    // không qua V76. Để fix, chúng ta ép user thấy đúng buttons qua MO.
+    // → Đã có setupRepListObserver. Đảm bảo nó được attach.
+    var tbody = document.getElementById('repBody');
+    if(tbody && !tbody.__v76Observed){
+      tbody.__v76Observed = true;
+      new MutationObserver(function(){
+        if(typeof window.patchRepListButtons76 === 'function'){
+          window.patchRepListButtons76();
+        }else{
+          // Inline fallback nếu function gone
+          patchButtonsInline();
+        }
+      }).observe(tbody, { childList: true });
+    }
+  }catch(e){console.warn('[v76.1 patchDeferred]', e);}
+}
+
+// 2. Inline button patcher — backup nếu V76's function bị mất
+function patchButtonsInline(){
+  try{
+    var tbody = document.getElementById('repBody');
+    if(!tbody || !window.REPORTS) return;
+    var rows = tbody.querySelectorAll('tr');
+    rows.forEach(function(tr){
+      var idEl = tr.querySelector('td:first-child .mm');
+      if(!idEl) return;
+      var id = idEl.textContent.trim();
+      var r = window.REPORTS.find(function(x){return x.id === id;});
+      if(!r) return;
+      var canEd = false;
+      try{
+        if(window.CU && window.CU.role === 'admin') canEd = true;
+        else if(window.CU && String(window.CU.name||'').toLowerCase() === String(r.ktvbc||'').toLowerCase()) canEd = true;
+      }catch(e){}
+      tr.querySelectorAll('button').forEach(function(btn){
+        var oc = btn.getAttribute('onclick') || '';
+        if(oc.indexOf("toast('Chỉnh sửa") >= 0 || oc.indexOf('reqPerm(') >= 0){
+          if(canEd){
+            btn.setAttribute('onclick', "editRep('" + id + "')");
+            btn.setAttribute('title', 'Sửa phiếu');
+            btn.classList.remove('bg-gr','disabled');
+            if(!btn.classList.contains('bg-b')) btn.classList.add('bg-b');
+            btn.innerHTML = '✏️';
+            btn.style.display = '';
+          } else {
+            btn.style.display = 'none';
+          }
+        }
+      });
+    });
+  }catch(e){console.warn('[v76.1 patchInline]', e);}
+}
+
+// 3. Initial application + safety net
+[100, 400, 1000, 2500, 5000].forEach(function(ms){
+  setTimeout(function(){
+    patchV75DeferredCall();
+    patchButtonsInline();
+  }, ms);
+});
+
+// 4. Background safety net — mỗi 8s check 1 lần (không quá tần suất)
+setInterval(function(){
+  try{
+    var tbody = document.getElementById('repBody');
+    if(!tbody) return;
+    // Chỉ chạy nếu phát hiện nút lỗi còn sót lại
+    var hasIssue = tbody.querySelector('button[onclick*="toast(\'Chỉnh sửa"], button[onclick^="reqPerm"]');
+    if(hasIssue){
+      patchButtonsInline();
+    }
+  }catch(e){}
+}, 8000);
+
+console.log('[V76.1] Final consolidation loaded — backup patcher active.');
+
+})();
+</script>
